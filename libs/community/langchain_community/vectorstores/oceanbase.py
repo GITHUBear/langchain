@@ -93,11 +93,12 @@ class OceanBase(VectorStore):
         self,
         connection_string: str,
         embedding_function: Embeddings,
-        embedding_dimension: int,
+        embedding_dimension: int = _LANGCHAIN_OCEANBASE_DEFAULT_EMBEDDING_DIM,
         collection_name: str = _LANGCHAIN_OCEANBASE_DEFAULT_COLLECTION_NAME,
         pre_delete_collection: bool = False,
         logger: Optional[logging.Logger] = None,
         engine_args: Optional[dict] = None,
+        delay_table_creation: bool = True,
     ) -> None:
         self.connection_string = connection_string
         self.embedding_function = embedding_function
@@ -105,6 +106,7 @@ class OceanBase(VectorStore):
         self.collection_name = collection_name
         self.pre_delete_collection = pre_delete_collection
         self.logger = logger or logging.getLogger(__name__)
+        self.delay_table_creation = delay_table_creation
         self.__post_init__(engine_args)
     
     def __post_init__(
@@ -131,7 +133,8 @@ class OceanBase(VectorStore):
     def create_collection(self) -> None:
         if self.pre_delete_collection:
             self.delete_collection()
-        self.create_table_if_not_exists()
+        if not self.delay_table_creation:
+            self.create_table_if_not_exists()
     
     def delete_collection(self) -> None:
         self.logger.debug("Trying to delete collection")
@@ -145,7 +148,7 @@ class OceanBase(VectorStore):
             self.collection_name,
             Base.metadata,
             Column("id", VARCHAR(40), primary_key=True),
-            Column("embedding", Vector(3)),
+            Column("embedding", Vector(self.embedding_dimension)),
             Column("document", LONGTEXT, nullable=True),
             Column("metadata", JSON, nullable=True),  # filter
             extend_existing=True,
@@ -171,14 +174,22 @@ class OceanBase(VectorStore):
         
         embeddings = self.embedding_function.embed_documents(list(texts))
 
+        if len(embeddings) == 0:
+            return ids
+
         if not metadatas:
             metadatas = [{} for _ in texts]
+        
+        if self.delay_table_creation:
+            self.embedding_dimension = len(embeddings[0])
+            self.create_table_if_not_exists()
+            self.delay_table_creation = False
 
         chunks_table = Table(
             self.collection_name,
             Base.metadata,
             Column("id", VARCHAR(40), primary_key=True),
-            Column("embedding", Vector(3)),
+            Column("embedding", Vector(self.embedding_dimension)),
             Column("document", LONGTEXT, nullable=True),
             Column("metadata", JSON, nullable=True),  # filter
             extend_existing=True,
@@ -295,7 +306,7 @@ class OceanBase(VectorStore):
             self.collection_name,
             Base.metadata,
             Column("id", VARCHAR(40), primary_key=True),
-            Column("embedding", Vector(3)),
+            Column("embedding", Vector(self.embedding_dimension)),
             Column("document", LONGTEXT, nullable=True),
             Column("metadata", JSON, nullable=True),  # filter
             extend_existing=True,
