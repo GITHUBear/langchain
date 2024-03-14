@@ -73,6 +73,7 @@ _module_lookup = {
     "MyScaleSettings": "langchain_community.vectorstores.myscale",
     "Neo4jVector": "langchain_community.vectorstores.neo4j_vector",
     "NeuralDBVectorStore": "langchain_community.vectorstores.thirdai_neuraldb",
+    "OceanBase": "langchain_community.vectorstores.oceanbase",
     "OpenSearchVectorSearch": "langchain_community.vectorstores.opensearch_vector_search",  # noqa: E501
     "PGEmbedding": "langchain_community.vectorstores.pgembedding",
     "PGVector": "langchain_community.vectorstores.pgvector",

@@ -39,6 +39,7 @@ _EXPECTED = [
     "MyScale",
     "MyScaleSettings",
     "Neo4jVector",
+    "OceanBase",
     "OpenSearchVectorSearch",
     "PGEmbedding",
     "PGVector",

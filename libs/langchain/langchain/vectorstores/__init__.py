@@ -82,6 +82,7 @@ __all__ = [
     "MyScale",
     "MyScaleSettings",
     "Neo4jVector",
+    "OceanBase",
     "OpenSearchVectorSearch",
     "PGEmbedding",
     "PGVector",
