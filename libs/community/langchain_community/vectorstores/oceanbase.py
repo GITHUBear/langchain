@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import uuid
+import json
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
-import numpy as np
+# import numpy as np
 import sqlalchemy
 from sqlalchemy import Column, String, Table, create_engine, insert, text
 from sqlalchemy.types import UserDefinedType, Float, String
@@ -27,26 +28,26 @@ Base = declarative_base()
 
 def from_db(value):
     # could be ndarray if already cast by lower-level driver
-    if value is None or isinstance(value, np.ndarray):
-        return value
-
-    return np.array(value[1:-1].split(','), dtype=np.float32)
+    # if value is None or isinstance(value, np.ndarray):
+    #     return value
+    return [float(v) for v in value[1:-1].split(',')]
+    # return np.array(value[1:-1].split(','), dtype=np.float32)
 
 def to_db(value, dim=None):
     if value is None:
         return value
 
-    if isinstance(value, np.ndarray):
-        if value.ndim != 1:
-            raise ValueError('expected ndim to be 1')
+    # if isinstance(value, np.ndarray):
+    #     if value.ndim != 1:
+    #         raise ValueError('expected ndim to be 1')
 
-        if not np.issubdtype(value.dtype, np.integer) and not np.issubdtype(value.dtype, np.floating):
-            raise ValueError('dtype must be numeric')
+    #     if not np.issubdtype(value.dtype, np.integer) and not np.issubdtype(value.dtype, np.floating):
+    #         raise ValueError('dtype must be numeric')
 
-        value = value.tolist()
+    #     value = value.tolist()
 
-    if dim is not None and len(value) != dim:
-        raise ValueError('expected %d dimensions, not %d' % (dim, len(value)))
+    # if dim is not None and len(value) != dim:
+    #     raise ValueError('expected %d dimensions, not %d' % (dim, len(value)))
 
     return '[' + ','.join([str(float(v)) for v in value]) + ']'
 
@@ -196,29 +197,32 @@ class OceanBase(VectorStore):
         )
 
         chunks_table_data = []
-        with self.engine.connect() as conn:
-            with conn.begin():
-                for document, metadata, chunk_id, embedding in zip(
-                    texts, metadatas, ids, embeddings
-                ):
-                    chunks_table_data.append(
-                        {
-                            "id": chunk_id,
-                            "embedding": embedding,
-                            "document": document,
-                            "metadata": metadata,
-                        }
-                    )
+        try:
+            with self.engine.connect() as conn:
+                with conn.begin():
+                    for document, metadata, chunk_id, embedding in zip(
+                        texts, metadatas, ids, embeddings
+                    ):
+                        chunks_table_data.append(
+                            {
+                                "id": chunk_id,
+                                "embedding": embedding,
+                                "document": document,
+                                "metadata": metadata,
+                            }
+                        )
 
-                    # Execute the batch insert when the batch size is reached
-                    if len(chunks_table_data) == batch_size:
+                        # Execute the batch insert when the batch size is reached
+                        if len(chunks_table_data) == batch_size:
+                            conn.execute(insert(chunks_table).values(chunks_table_data))
+                            # Clear the chunks_table_data list for the next batch
+                            chunks_table_data.clear()
+
+                    # Insert any remaining records that didn't make up a full batch
+                    if chunks_table_data:
                         conn.execute(insert(chunks_table).values(chunks_table_data))
-                        # Clear the chunks_table_data list for the next batch
-                        chunks_table_data.clear()
-
-                # Insert any remaining records that didn't make up a full batch
-                if chunks_table_data:
-                    conn.execute(insert(chunks_table).values(chunks_table_data))
+        except Exception as e:
+            print(f"OceanBase add_text failed: {str(e)}")
 
         return ids
 
@@ -230,7 +234,7 @@ class OceanBase(VectorStore):
         **kwargs: Any,
     ) -> List[Document]:
         embedding = self.embedding_function.embed_query(query)
-        docs = self.similarity_search_with_score_by_vector(
+        docs = self.similarity_search_by_vector(
             embedding=embedding, k=k, filter=filter
         )
         return docs
@@ -263,21 +267,29 @@ class OceanBase(VectorStore):
         
         # filter is not support in OceanBase.
 
+        embedding_str = to_db(embedding, self.embedding_dimension)
         sql_query = f"""
-            SELECT *, embedding <-> :embedding as distance
+            SELECT document, metadata, embedding <-> '{embedding_str}' as distance
             FROM {self.collection_name}
-            ORDER BY embedding <-> :embedding
+            ORDER BY embedding <-> '{embedding_str}'
             LIMIT :k
         """
-        params = {"embedding": embedding, "k": k}
+        params = {"k": k}
         with self.engine.connect() as conn:
             results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
-        
+        # for result in results:
+        #     doc_type = type(result.document)
+        #     dis_type = type(result.distance)
+        #     meta_type = type(result.metadata)
+        #     print(f"hhhhhh1, {result.document}, {doc_type}")
+        #     print(f"hhhhhh2, {result.distance}, {dis_type}")
+        #     print(f"hhhhhh3, {result.metadata}, {meta_type}")
+        #     break
         documents_with_scores = [
             (
                 Document(
                     page_content=result.document,
-                    metadata=result.metadata,
+                    metadata=json.loads(result.metadata),
                 ),
                 result.distance if self.embedding_function is not None else None,
             )
