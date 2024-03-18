@@ -27,27 +27,11 @@ _LANGCHAIN_OCEANBASE_DEFAULT_COLLECTION_NAME = "langchain_document"
 Base = declarative_base()
 
 def from_db(value):
-    # could be ndarray if already cast by lower-level driver
-    # if value is None or isinstance(value, np.ndarray):
-    #     return value
     return [float(v) for v in value[1:-1].split(',')]
-    # return np.array(value[1:-1].split(','), dtype=np.float32)
 
 def to_db(value, dim=None):
     if value is None:
         return value
-
-    # if isinstance(value, np.ndarray):
-    #     if value.ndim != 1:
-    #         raise ValueError('expected ndim to be 1')
-
-    #     if not np.issubdtype(value.dtype, np.integer) and not np.issubdtype(value.dtype, np.floating):
-    #         raise ValueError('dtype must be numeric')
-
-    #     value = value.tolist()
-
-    # if dim is not None and len(value) != dim:
-    #     raise ValueError('expected %d dimensions, not %d' % (dim, len(value)))
 
     return '[' + ','.join([str(float(v)) for v in value]) + ']'
 
@@ -145,19 +129,19 @@ class OceanBase(VectorStore):
                 conn.execute(drop_statement)
     
     def create_table_if_not_exists(self) -> None:
-        Table(
-            self.collection_name,
-            Base.metadata,
-            Column("id", VARCHAR(40), primary_key=True),
-            Column("embedding", Vector(self.embedding_dimension)),
-            Column("document", LONGTEXT, nullable=True),
-            Column("metadata", JSON, nullable=True),  # filter
-            extend_existing=True,
-        )
+        create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS `{self.collection_name}` (
+                id VARCHAR(40) NOT NULL, 
+                embedding VECTOR({self.embedding_dimension}), 
+                document LONGTEXT, 
+                metadata JSON, 
+                PRIMARY KEY (id)
+            )
+        """
         with self.engine.connect() as conn:
             with conn.begin():
                 # Create the table
-                Base.metadata.create_all(conn)
+                conn.execute(text(create_table_query))
     
     def create_collection_ivfflat_index(self) -> None:
         pass
@@ -193,7 +177,7 @@ class OceanBase(VectorStore):
             Column("embedding", Vector(self.embedding_dimension)),
             Column("document", LONGTEXT, nullable=True),
             Column("metadata", JSON, nullable=True),  # filter
-            extend_existing=True,
+            keep_existing=True,
         )
 
         chunks_table_data = []
@@ -277,14 +261,7 @@ class OceanBase(VectorStore):
         params = {"k": k}
         with self.engine.connect() as conn:
             results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
-        # for result in results:
-        #     doc_type = type(result.document)
-        #     dis_type = type(result.distance)
-        #     meta_type = type(result.metadata)
-        #     print(f"hhhhhh1, {result.document}, {doc_type}")
-        #     print(f"hhhhhh2, {result.distance}, {dis_type}")
-        #     print(f"hhhhhh3, {result.metadata}, {meta_type}")
-        #     break
+        
         documents_with_scores = [
             (
                 Document(
@@ -321,7 +298,7 @@ class OceanBase(VectorStore):
             Column("embedding", Vector(self.embedding_dimension)),
             Column("document", LONGTEXT, nullable=True),
             Column("metadata", JSON, nullable=True),  # filter
-            extend_existing=True,
+            keep_existing=True,
         )
 
         try:
@@ -331,7 +308,7 @@ class OceanBase(VectorStore):
                     conn.execute(chunks_table.delete().where(delete_condition))
                     return True
         except Exception as e:
-            print("Delete operation failed:", str(e))
+            self.logger.error("Delete operation failed:", str(e))
             return False
 
     @classmethod
