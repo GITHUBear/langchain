@@ -6,7 +6,6 @@ import json
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 # import numpy as np
-import sqlalchemy
 from sqlalchemy import Column, String, Table, create_engine, insert, text
 from sqlalchemy.types import UserDefinedType, Float, String
 from sqlalchemy.dialects.mysql import JSON, LONGTEXT, VARCHAR
@@ -23,6 +22,7 @@ from langchain_core.vectorstores import VectorStore
 
 _LANGCHAIN_OCEANBASE_DEFAULT_EMBEDDING_DIM = 1536
 _LANGCHAIN_OCEANBASE_DEFAULT_COLLECTION_NAME = "langchain_document"
+_LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD = 10000
 
 Base = declarative_base()
 
@@ -84,6 +84,8 @@ class OceanBase(VectorStore):
         logger: Optional[logging.Logger] = None,
         engine_args: Optional[dict] = None,
         delay_table_creation: bool = True,
+        th_create_ivfflat_index: int = _LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD,
+        sql_logger: Optional[logging.Logger] = None,
     ) -> None:
         self.connection_string = connection_string
         self.embedding_function = embedding_function
@@ -92,6 +94,9 @@ class OceanBase(VectorStore):
         self.pre_delete_collection = pre_delete_collection
         self.logger = logger or logging.getLogger(__name__)
         self.delay_table_creation = delay_table_creation
+        self.th_create_ivfflat_index = th_create_ivfflat_index
+        self.ivfflat_index_created = False
+        self.sql_logger = sql_logger
         self.__post_init__(engine_args)
     
     def __post_init__(
@@ -122,8 +127,9 @@ class OceanBase(VectorStore):
             self.create_table_if_not_exists()
     
     def delete_collection(self) -> None:
-        self.logger.debug("Trying to delete collection")
-        drop_statement = text(f"DROP TABLE IF EXISTS {self.collection_name};")
+        drop_statement = text(f"DROP TABLE IF EXISTS {self.collection_name}")
+        if self.sql_logger is not None:
+            self.sql_logger.debug(f"Trying to delete collection: {drop_statement}")
         with self.engine.connect() as conn:
             with conn.begin():
                 conn.execute(drop_statement)
@@ -138,13 +144,25 @@ class OceanBase(VectorStore):
                 PRIMARY KEY (id)
             )
         """
+        if self.sql_logger is not None:
+            self.sql_logger.debug(f"Trying to create table: {create_table_query}")
         with self.engine.connect() as conn:
             with conn.begin():
                 # Create the table
                 conn.execute(text(create_table_query))
     
-    def create_collection_ivfflat_index(self) -> None:
-        pass
+    def create_collection_ivfflat_index_if_not_exists(self) -> None:
+        create_index_query = f"""
+            CREATE INDEX IF NOT EXISTS `embedding_idx` on `{self.collection_name}` (
+                embedding l2
+            ) using ivfflat
+        """
+        if self.sql_logger is not None:
+            self.sql_logger.debug(f"Trying to create ivfflat index: {create_index_query}")
+        with self.engine.connect() as conn:
+            with conn.begin():
+                # Create Ivfflat Index
+                conn.execute(text(create_index_query))
 
     def add_texts(
         self,
@@ -180,6 +198,9 @@ class OceanBase(VectorStore):
             keep_existing=True,
         )
 
+        row_count_query = f"""
+            SELECT COUNT(*) as count FROM `{self.collection_name}`
+        """
         chunks_table_data = []
         try:
             with self.engine.connect() as conn:
@@ -198,13 +219,28 @@ class OceanBase(VectorStore):
 
                         # Execute the batch insert when the batch size is reached
                         if len(chunks_table_data) == batch_size:
+                            if self.sql_logger is not None:
+                                insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
+                                self.sql_logger.debug(f"Trying to insert vectors: {insert_sql_for_log}")
                             conn.execute(insert(chunks_table).values(chunks_table_data))
                             # Clear the chunks_table_data list for the next batch
                             chunks_table_data.clear()
 
                     # Insert any remaining records that didn't make up a full batch
                     if chunks_table_data:
+                        if self.sql_logger is not None:
+                            insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
+                            self.sql_logger.debug(f"Trying to insert vectors: {insert_sql_for_log}")
                         conn.execute(insert(chunks_table).values(chunks_table_data))
+                    
+                    if self.sql_logger is not None:
+                        self.sql_logger.debug(f"Get the number of vectors: {row_count_query}")
+                    row_cnt_res = conn.execute(text(row_count_query))
+                    for row in row_cnt_res:
+                        if row.count > self.th_create_ivfflat_index and (not self.ivfflat_index_created):
+                            self.create_collection_ivfflat_index_if_not_exists()
+                            self.ivfflat_index_created = True
+
         except Exception as e:
             print(f"OceanBase add_text failed: {str(e)}")
 
@@ -258,6 +294,15 @@ class OceanBase(VectorStore):
             ORDER BY embedding <-> '{embedding_str}'
             LIMIT :k
         """
+        sql_query_str_for_log = f"""
+            SELECT document, metadata, embedding <-> '?' as distance
+            FROM {self.collection_name}
+            ORDER BY embedding <-> '?'
+            LIMIT {k}
+        """
+
+        if self.sql_logger is not None:
+            self.sql_logger.debug(f"Trying to do similarity search: {sql_query_str_for_log}")
         params = {"k": k}
         with self.engine.connect() as conn:
             results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
@@ -305,7 +350,10 @@ class OceanBase(VectorStore):
             with self.engine.connect() as conn:
                 with conn.begin():
                     delete_condition = chunks_table.c.id.in_(ids)
-                    conn.execute(chunks_table.delete().where(delete_condition))
+                    delete_stmt = chunks_table.delete().where(delete_condition)
+                    if self.sql_logger is not None:
+                        self.sql_logger.debug(f"Trying to delete vectors: {str(delete_stmt)}")
+                    conn.execute(delete_stmt)
                     return True
         except Exception as e:
             self.logger.error("Delete operation failed:", str(e))
