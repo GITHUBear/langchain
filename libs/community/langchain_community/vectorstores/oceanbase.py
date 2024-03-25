@@ -304,20 +304,24 @@ class OceanBase(VectorStore):
         if self.sql_logger is not None:
             self.sql_logger.debug(f"Trying to do similarity search: {sql_query_str_for_log}")
         params = {"k": k}
-        with self.engine.connect() as conn:
-            results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
-        
-        documents_with_scores = [
-            (
-                Document(
-                    page_content=result.document,
-                    metadata=json.loads(result.metadata),
-                ),
-                result.distance if self.embedding_function is not None else None,
-            )
-            for result in results
-        ]
-        return documents_with_scores
+        try:
+            with self.engine.connect() as conn:
+                results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
+            
+            documents_with_scores = [
+                (
+                    Document(
+                        page_content=result.document,
+                        metadata=json.loads(result.metadata),
+                    ),
+                    result.distance if self.embedding_function is not None else None,
+                )
+                for result in results
+            ]
+            return documents_with_scores
+        except Exception as e:
+            self.logger.error("similarity_search_with_score_by_vector failed:", str(e))
+            return []
         
     def similarity_search_with_score(
         self,
