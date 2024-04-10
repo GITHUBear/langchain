@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 import json
+import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 # import numpy as np
@@ -22,7 +23,7 @@ from langchain_core.vectorstores import VectorStore
 
 _LANGCHAIN_OCEANBASE_DEFAULT_EMBEDDING_DIM = 1536
 _LANGCHAIN_OCEANBASE_DEFAULT_COLLECTION_NAME = "langchain_document"
-_LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD = 10000
+_LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD = 1000
 
 Base = declarative_base()
 
@@ -72,7 +73,37 @@ class Vector(UserDefinedType):
 
         def cosine_distance(self, other):
             return self.op('<=>', return_type=Float)(other)
-        
+
+class OceanBaseCollectionStat:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.maybe_collection_not_exist = True
+        self.maybe_collection_index_not_exist = True
+    
+    def collection_exists(self):
+        with self._lock:
+            self.maybe_collection_not_exist = False
+    
+    def collection_index_exists(self):
+        with self._lock:
+            self.maybe_collection_index_not_exist = False
+
+    def collection_not_exists(self):
+        with self._lock:
+            self.maybe_collection_not_exist = True
+    
+    def collection_index_not_exists(self):
+        with self._lock:
+            self.maybe_collection_index_not_exist = True
+    
+    def get_maybe_collection_not_exist(self):
+        with self._lock:
+            return self.maybe_collection_not_exist
+
+    def get_maybe_collection_index_not_exist(self):
+        with self._lock:
+            return self.maybe_collection_index_not_exist
+
 class OceanBase(VectorStore):
     def __init__(
         self,
@@ -84,8 +115,10 @@ class OceanBase(VectorStore):
         logger: Optional[logging.Logger] = None,
         engine_args: Optional[dict] = None,
         delay_table_creation: bool = True,
+        enable_index: bool = False,
         th_create_ivfflat_index: int = _LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD,
         sql_logger: Optional[logging.Logger] = None,
+        collection_stat: Optional[OceanBaseCollectionStat] = None,
     ) -> None:
         self.connection_string = connection_string
         self.embedding_function = embedding_function
@@ -95,8 +128,9 @@ class OceanBase(VectorStore):
         self.logger = logger or logging.getLogger(__name__)
         self.delay_table_creation = delay_table_creation
         self.th_create_ivfflat_index = th_create_ivfflat_index
-        self.ivfflat_index_created = False
+        self.enable_index = enable_index
         self.sql_logger = sql_logger
+        self.collection_stat = collection_stat
         self.__post_init__(engine_args)
     
     def __post_init__(
@@ -123,8 +157,10 @@ class OceanBase(VectorStore):
     def create_collection(self) -> None:
         if self.pre_delete_collection:
             self.delete_collection()
-        if not self.delay_table_creation:
+        if not self.delay_table_creation and (self.collection_stat is None or self.collection_stat.get_maybe_collection_not_exist()):
             self.create_table_if_not_exists()
+            if self.collection_stat is not None:
+                self.collection_stat.collection_exists()
     
     def delete_collection(self) -> None:
         drop_statement = text(f"DROP TABLE IF EXISTS {self.collection_name}")
@@ -133,6 +169,9 @@ class OceanBase(VectorStore):
         with self.engine.connect() as conn:
             with conn.begin():
                 conn.execute(drop_statement)
+                if self.collection_stat is not None:
+                    self.collection_stat.collection_not_exists()
+                    self.collection_stat.collection_index_not_exists()
     
     def create_table_if_not_exists(self) -> None:
         create_table_query = f"""
@@ -155,7 +194,7 @@ class OceanBase(VectorStore):
         create_index_query = f"""
             CREATE INDEX IF NOT EXISTS `embedding_idx` on `{self.collection_name}` (
                 embedding l2
-            ) using ivfflat
+            ) using ivfflat with (lists=20)
         """
         if self.sql_logger is not None:
             self.sql_logger.debug(f"Trying to create ivfflat index: {create_index_query}")
@@ -183,10 +222,12 @@ class OceanBase(VectorStore):
         if not metadatas:
             metadatas = [{} for _ in texts]
         
-        if self.delay_table_creation:
+        if self.delay_table_creation and (self.collection_stat is None or self.collection_stat.get_maybe_collection_not_exist()):
             self.embedding_dimension = len(embeddings[0])
             self.create_table_if_not_exists()
             self.delay_table_creation = False
+            if self.collection_stat is not None:
+                self.collection_stat.collection_exists()
 
         chunks_table = Table(
             self.collection_name,
@@ -202,47 +243,53 @@ class OceanBase(VectorStore):
             SELECT COUNT(*) as count FROM `{self.collection_name}`
         """
         chunks_table_data = []
-        try:
-            with self.engine.connect() as conn:
-                with conn.begin():
-                    for document, metadata, chunk_id, embedding in zip(
-                        texts, metadatas, ids, embeddings
-                    ):
-                        chunks_table_data.append(
-                            {
-                                "id": chunk_id,
-                                "embedding": embedding,
-                                "document": document,
-                                "metadata": metadata,
-                            }
-                        )
+        # try:
+        with self.engine.connect() as conn:
+            with conn.begin():
+                for document, metadata, chunk_id, embedding in zip(
+                    texts, metadatas, ids, embeddings
+                ):
+                    chunks_table_data.append(
+                        {
+                            "id": chunk_id,
+                            "embedding": embedding,
+                            "document": document,
+                            "metadata": metadata,
+                        }
+                    )
 
-                        # Execute the batch insert when the batch size is reached
-                        if len(chunks_table_data) == batch_size:
-                            if self.sql_logger is not None:
-                                insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
-                                self.sql_logger.debug(f"Trying to insert vectors: {insert_sql_for_log}")
-                            conn.execute(insert(chunks_table).values(chunks_table_data))
-                            # Clear the chunks_table_data list for the next batch
-                            chunks_table_data.clear()
-
-                    # Insert any remaining records that didn't make up a full batch
-                    if chunks_table_data:
+                    # Execute the batch insert when the batch size is reached
+                    if len(chunks_table_data) == batch_size:
                         if self.sql_logger is not None:
                             insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
-                            self.sql_logger.debug(f"Trying to insert vectors: {insert_sql_for_log}")
+                            self.sql_logger.debug(
+                                f"""Trying to insert vectors: 
+                                    {insert_sql_for_log}""")
                         conn.execute(insert(chunks_table).values(chunks_table_data))
-                    
+                        # Clear the chunks_table_data list for the next batch
+                        chunks_table_data.clear()
+
+                # Insert any remaining records that didn't make up a full batch
+                if chunks_table_data:
                     if self.sql_logger is not None:
-                        self.sql_logger.debug(f"Get the number of vectors: {row_count_query}")
+                        insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
+                        self.sql_logger.debug(
+                            f"""Trying to insert vectors: 
+                                {insert_sql_for_log}""")
+                    conn.execute(insert(chunks_table).values(chunks_table_data))
+                
+                # if self.sql_logger is not None:
+                #     self.sql_logger.debug(f"Get the number of vectors: {row_count_query}")
+                if self.enable_index and (self.collection_stat is None or self.collection_stat.get_maybe_collection_index_not_exist()):
                     row_cnt_res = conn.execute(text(row_count_query))
                     for row in row_cnt_res:
-                        if row.count > self.th_create_ivfflat_index and (not self.ivfflat_index_created):
+                        if row.count > self.th_create_ivfflat_index:
                             self.create_collection_ivfflat_index_if_not_exists()
-                            self.ivfflat_index_created = True
+                            if self.collection_stat is not None:
+                                self.collection_stat.collection_index_exists()
 
-        except Exception as e:
-            print(f"OceanBase add_text failed: {str(e)}")
+        # except Exception as e:
+        #     print(f"OceanBase add_text failed: {str(e)}")
 
         return ids
 
