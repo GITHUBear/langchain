@@ -23,7 +23,8 @@ from langchain_core.vectorstores import VectorStore
 
 _LANGCHAIN_OCEANBASE_DEFAULT_EMBEDDING_DIM = 1536
 _LANGCHAIN_OCEANBASE_DEFAULT_COLLECTION_NAME = "langchain_document"
-_LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD = 1000
+_LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD = 10000
+_LANGCHAIN_OCEANBASE_DEFAULT_RWLOCK_MAX_READER = 64
 
 Base = declarative_base()
 
@@ -103,6 +104,76 @@ class OceanBaseCollectionStat:
     def get_maybe_collection_index_not_exist(self):
         with self._lock:
             return self.maybe_collection_index_not_exist
+
+class OceanBaseGlobalRWLock:
+    def __init__(self, max_readers) -> None:
+        self.max_readers_ = max_readers
+        self.writer_entered_ = False
+        self.reader_cnt_ = 0            
+        self.mutex_ = threading.Lock()
+        self.writer_cv_ = threading.Condition(self.mutex_)
+        self.reader_cv_ = threading.Condition(self.mutex_)
+
+    def rlock(self):
+        self.mutex_.acquire()
+        while self.writer_entered_ or self.max_readers_ == self.reader_cnt_:
+            self.reader_cv_.wait()
+        self.reader_cnt_ += 1
+        self.mutex_.release()
+
+    def runlock(self):
+        self.mutex_.acquire()
+        self.reader_cnt_ -= 1
+        if self.writer_entered_:
+            if 0 == self.reader_cnt_:
+                self.writer_cv_.notify(1)
+        else:
+            if self.max_readers_ - 1 == self.reader_cnt_:
+                self.reader_cv_.notify(1)
+        self.mutex_.release()
+
+    def wlock(self):
+        self.mutex_.acquire()
+        while self.writer_entered_:
+            self.reader_cv_.wait()
+        self.writer_entered_ = True
+        while 0 < self.reader_cnt_:
+            self.writer_cv_.wait()
+        self.mutex_.release()
+
+    def wunlock(self):
+        self.mutex_.acquire()
+        self.writer_entered_ = False
+        self.reader_cv_.notifyAll()
+        self.mutex_.release()
+    
+    class OBRLock:
+        def __init__(self, rwlock) -> None:
+            self.rwlock_ = rwlock
+            
+        def __enter__(self):
+            self.rwlock_.rlock()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.rwlock_.runlock()
+
+    class OBWLock:
+        def __init__(self, rwlock) -> None:
+            self.rwlock_ = rwlock
+
+        def __enter__(self):
+            self.rwlock_.wlock()
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.rwlock_.wunlock()
+
+    def reader_lock(self):
+        return self.OBRLock(self)
+    
+    def writer_lock(self):
+        return self.OBWLock(self)
+
+ob_grwlock = OceanBaseGlobalRWLock(_LANGCHAIN_OCEANBASE_DEFAULT_RWLOCK_MAX_READER)
 
 class OceanBase(VectorStore):
     def __init__(
@@ -196,12 +267,13 @@ class OceanBase(VectorStore):
                 embedding l2
             ) using ivfflat with (lists=20)
         """
-        if self.sql_logger is not None:
-            self.sql_logger.debug(f"Trying to create ivfflat index: {create_index_query}")
-        with self.engine.connect() as conn:
-            with conn.begin():
-                # Create Ivfflat Index
-                conn.execute(text(create_index_query))
+        with ob_grwlock.writer_lock():
+            with self.engine.connect() as conn:
+                with conn.begin():
+                    # Create Ivfflat Index
+                    if self.sql_logger is not None:
+                        self.sql_logger.debug(f"Trying to create ivfflat index: {create_index_query}")
+                    conn.execute(text(create_index_query))
 
     def add_texts(
         self,
@@ -260,28 +332,31 @@ class OceanBase(VectorStore):
 
                     # Execute the batch insert when the batch size is reached
                     if len(chunks_table_data) == batch_size:
+                        with ob_grwlock.reader_lock():
+                            if self.sql_logger is not None:
+                                insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
+                                self.sql_logger.debug(
+                                    f"""Trying to insert vectors: 
+                                        {insert_sql_for_log}""")
+                            conn.execute(insert(chunks_table).values(chunks_table_data))
+                        # Clear the chunks_table_data list for the next batch
+                        chunks_table_data.clear()
+
+                # Insert any remaining records that didn't make up a full batch
+                if chunks_table_data:
+                    with ob_grwlock.reader_lock():
                         if self.sql_logger is not None:
                             insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
                             self.sql_logger.debug(
                                 f"""Trying to insert vectors: 
                                     {insert_sql_for_log}""")
                         conn.execute(insert(chunks_table).values(chunks_table_data))
-                        # Clear the chunks_table_data list for the next batch
-                        chunks_table_data.clear()
-
-                # Insert any remaining records that didn't make up a full batch
-                if chunks_table_data:
-                    if self.sql_logger is not None:
-                        insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
-                        self.sql_logger.debug(
-                            f"""Trying to insert vectors: 
-                                {insert_sql_for_log}""")
-                    conn.execute(insert(chunks_table).values(chunks_table_data))
                 
                 # if self.sql_logger is not None:
                 #     self.sql_logger.debug(f"Get the number of vectors: {row_count_query}")
                 if self.enable_index and (self.collection_stat is None or self.collection_stat.get_maybe_collection_index_not_exist()):
-                    row_cnt_res = conn.execute(text(row_count_query))
+                    with ob_grwlock.reader_lock():
+                        row_cnt_res = conn.execute(text(row_count_query))
                     for row in row_cnt_res:
                         if row.count > self.th_create_ivfflat_index:
                             self.create_collection_ivfflat_index_if_not_exists()
@@ -348,12 +423,13 @@ class OceanBase(VectorStore):
             LIMIT {k}
         """
 
-        if self.sql_logger is not None:
-            self.sql_logger.debug(f"Trying to do similarity search: {sql_query_str_for_log}")
         params = {"k": k}
         try:
-            with self.engine.connect() as conn:
-                results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
+            with ob_grwlock.reader_lock():
+                with self.engine.connect() as conn:
+                    if self.sql_logger is not None:
+                        self.sql_logger.debug(f"Trying to do similarity search: {sql_query_str_for_log}")
+                    results: Sequence[Row] = conn.execute(text(sql_query), params).fetchall()
             
             documents_with_scores = [
                 (
@@ -402,9 +478,10 @@ class OceanBase(VectorStore):
                 with conn.begin():
                     delete_condition = chunks_table.c.id.in_(ids)
                     delete_stmt = chunks_table.delete().where(delete_condition)
-                    if self.sql_logger is not None:
-                        self.sql_logger.debug(f"Trying to delete vectors: {str(delete_stmt)}")
-                    conn.execute(delete_stmt)
+                    with ob_grwlock.reader_lock():
+                        if self.sql_logger is not None:
+                            self.sql_logger.debug(f"Trying to delete vectors: {str(delete_stmt)}")
+                        conn.execute(delete_stmt)
                     return True
         except Exception as e:
             self.logger.error("Delete operation failed:", str(e))
