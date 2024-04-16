@@ -4,6 +4,9 @@ import logging
 import uuid
 import json
 import threading
+import time
+import random
+from requests.exceptions import HTTPError
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Type
 
 # import numpy as np
@@ -190,11 +193,14 @@ class OceanBase(VectorStore):
         th_create_ivfflat_index: int = _LANGCHAIN_OCEANBASE_DEFAULT_IVFFLAT_CREATION_ROW_THRESHOLD,
         sql_logger: Optional[logging.Logger] = None,
         collection_stat: Optional[OceanBaseCollectionStat] = None,
+        subtitle_embedding_dimension: int = -1,
     ) -> None:
         self.connection_string = connection_string
         self.embedding_function = embedding_function
         self.embedding_dimension = embedding_dimension
+        self.subtitle_embedding_dimension = subtitle_embedding_dimension
         self.collection_name = collection_name
+        self.subtitle_collection_name = "__subtitle_" + self.collection_name
         self.pre_delete_collection = pre_delete_collection
         self.logger = logger or logging.getLogger(__name__)
         self.delay_table_creation = delay_table_creation
@@ -235,11 +241,13 @@ class OceanBase(VectorStore):
     
     def delete_collection(self) -> None:
         drop_statement = text(f"DROP TABLE IF EXISTS {self.collection_name}")
+        drop_subtitle_statement = text(f"DROP TABLE IF EXISTS {self.subtitle_collection_name}")
         if self.sql_logger is not None:
-            self.sql_logger.debug(f"Trying to delete collection: {drop_statement}")
+            self.sql_logger.debug(f"Trying to delete collection: {drop_statement} & {drop_subtitle_statement}")
         with self.engine.connect() as conn:
             with conn.begin():
                 conn.execute(drop_statement)
+                conn.execute(drop_subtitle_statement)
                 if self.collection_stat is not None:
                     self.collection_stat.collection_not_exists()
                     self.collection_stat.collection_index_not_exists()
@@ -254,16 +262,31 @@ class OceanBase(VectorStore):
                 PRIMARY KEY (id)
             )
         """
+        create_subtitle_table_query = f"""
+            CREATE TABLE IF NOT EXISTS `{self.subtitle_collection_name}` (
+                id VARCHAR(40) NOT NULL, 
+                embedding VECTOR({self.subtitle_embedding_dimension}),
+                subtitles LONGTEXT,
+                PRIMARY KEY (id)
+            )
+        """
         if self.sql_logger is not None:
-            self.sql_logger.debug(f"Trying to create table: {create_table_query}")
+            self.sql_logger.debug(f"Trying to create table: {create_table_query} & {create_subtitle_table_query}")
         with self.engine.connect() as conn:
             with conn.begin():
                 # Create the table
                 conn.execute(text(create_table_query))
+                if self.subtitle_embedding_dimension != -1:
+                    conn.execute(text(create_subtitle_table_query))
     
     def create_collection_ivfflat_index_if_not_exists(self) -> None:
         create_index_query = f"""
             CREATE INDEX IF NOT EXISTS `embedding_idx` on `{self.collection_name}` (
+                embedding l2
+            ) using ivfflat with (lists=20)
+        """
+        create_subtitle_index_query = f"""
+            CREATE INDEX IF NOT EXISTS `embedding_idx` on `{self.subtitle_collection_name}` (
                 embedding l2
             ) using ivfflat with (lists=20)
         """
@@ -272,8 +295,28 @@ class OceanBase(VectorStore):
                 with conn.begin():
                     # Create Ivfflat Index
                     if self.sql_logger is not None:
-                        self.sql_logger.debug(f"Trying to create ivfflat index: {create_index_query}")
+                        if self.subtitle_embedding_dimension == -1:
+                            self.sql_logger.debug(f"Trying to create ivfflat index: {create_index_query}")
+                        else:
+                            self.sql_logger.debug(f"Trying to create ivfflat index: {create_index_query} & {create_subtitle_index_query}")
                     conn.execute(text(create_index_query))
+                    if self.subtitle_embedding_dimension != -1:
+                        conn.execute(text(create_subtitle_index_query))
+
+    def do_embedding(self, texts: Iterable[str]):
+        retry_count = 0
+        max_retries = 5
+        while retry_count < max_retries:
+            try:
+                embeddings = self.embedding_function.embed_documents(list(texts))
+            except Exception as e:
+                retry_count += 1
+                time.sleep(0.1 * (2 ** (retry_count - 2)) + random.uniform(0, 0.1 * (2 ** (retry_count - 2))))
+                continue
+            break
+        if retry_count >= max_retries:
+            raise Exception(f"Failed to embedding after {max_retries} attempts.")
+        return embeddings
 
     def add_texts(
         self,
@@ -281,12 +324,16 @@ class OceanBase(VectorStore):
         metadatas: Optional[List[dict]] = None,
         ids: Optional[List[str]] = None,
         batch_size: int = 500,
+        subtitles: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> List[str]:
         if ids is None:
             ids = [str(uuid.uuid1()) for _ in texts]
         
         embeddings = self.embedding_function.embed_documents(list(texts))
+
+        if not (subtitles is None):
+            subtitle_embeddings = self.embedding_function.embed_documents(list(subtitles))
 
         if len(embeddings) == 0:
             return ids
@@ -296,6 +343,8 @@ class OceanBase(VectorStore):
         
         if self.delay_table_creation and (self.collection_stat is None or self.collection_stat.get_maybe_collection_not_exist()):
             self.embedding_dimension = len(embeddings[0])
+            if not (subtitles is None):
+                self.subtitle_embedding_dimension = len(subtitle_embeddings[0])
             self.create_table_if_not_exists()
             self.delay_table_creation = False
             if self.collection_stat is not None:
@@ -311,15 +360,25 @@ class OceanBase(VectorStore):
             keep_existing=True,
         )
 
+        subtitle_table = Table(
+            self.subtitle_collection_name,
+            Base.metadata,
+            Column("id", VARCHAR(40), primary_key=True),
+            Column("embedding", Vector(self.subtitle_embedding_dimension)),
+            Column("subtitles", LONGTEXT, nullable=True),
+            keep_existing=True,
+        )
+
         row_count_query = f"""
             SELECT COUNT(*) as count FROM `{self.collection_name}`
         """
         chunks_table_data = []
+        subtitle_table_data = []
         # try:
         with self.engine.connect() as conn:
             with conn.begin():
-                for document, metadata, chunk_id, embedding in zip(
-                    texts, metadatas, ids, embeddings
+                for document, metadata, chunk_id, embedding, sub_embedding, subtitle in zip(
+                    texts, metadatas, ids, embeddings, subtitle_embeddings, subtitles
                 ):
                     chunks_table_data.append(
                         {
@@ -330,27 +389,61 @@ class OceanBase(VectorStore):
                         }
                     )
 
+                    if self.subtitle_embedding_dimension != -1:
+                        subtitle_table_data.append(
+                            {
+                                "id": chunk_id,
+                                "embedding": sub_embedding,
+                                "subtitles": subtitle,
+                            }
+                        )
+
                     # Execute the batch insert when the batch size is reached
                     if len(chunks_table_data) == batch_size:
                         with ob_grwlock.reader_lock():
                             if self.sql_logger is not None:
                                 insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
-                                self.sql_logger.debug(
-                                    f"""Trying to insert vectors: 
-                                        {insert_sql_for_log}""")
+                                if self.subtitle_embedding_dimension == -1:
+                                    self.sql_logger.debug(
+                                        f"""Trying to insert vectors: 
+                                            {insert_sql_for_log}
+                                        """)
+                                else:
+                                    insert_subtitle_sql_for_log = str(insert(subtitle_table).values(subtitle_table_data))
+                                    self.sql_logger.debug(
+                                        f"""Trying to insert vectors: 
+                                            {insert_sql_for_log} &
+                                            {insert_subtitle_sql_for_log}
+                                        """
+                                        )
+
                             conn.execute(insert(chunks_table).values(chunks_table_data))
+                            if self.subtitle_embedding_dimension != -1:
+                                conn.execute(insert(subtitle_table).values(subtitle_table_data))
                         # Clear the chunks_table_data list for the next batch
                         chunks_table_data.clear()
+                        subtitle_table_data.clear()
 
                 # Insert any remaining records that didn't make up a full batch
                 if chunks_table_data:
                     with ob_grwlock.reader_lock():
                         if self.sql_logger is not None:
                             insert_sql_for_log = str(insert(chunks_table).values(chunks_table_data))
-                            self.sql_logger.debug(
-                                f"""Trying to insert vectors: 
-                                    {insert_sql_for_log}""")
+                            if self.subtitle_embedding_dimension == -1:
+                                self.sql_logger.debug(
+                                    f"""Trying to insert vectors: 
+                                        {insert_sql_for_log}""")
+                            else:
+                                insert_subtitle_sql_for_log = str(insert(subtitle_table).values(subtitle_table_data))
+                                self.sql_logger.debug(
+                                        f"""Trying to insert vectors: 
+                                            {insert_sql_for_log} &
+                                            {insert_subtitle_sql_for_log}
+                                        """
+                                        )
                         conn.execute(insert(chunks_table).values(chunks_table_data))
+                        if self.subtitle_embedding_dimension != -1:
+                            conn.execute(insert(subtitle_table).values(subtitle_table_data))
                 
                 # if self.sql_logger is not None:
                 #     self.sql_logger.debug(f"Get the number of vectors: {row_count_query}")
@@ -373,11 +466,12 @@ class OceanBase(VectorStore):
         query: str,
         k: int = 4,
         filter: Optional[dict] = None,
+        enable_subtitle: bool = False,
         **kwargs: Any,
     ) -> List[Document]:
         embedding = self.embedding_function.embed_query(query)
         docs = self.similarity_search_by_vector(
-            embedding=embedding, k=k, filter=filter
+            embedding=embedding, k=k, filter=filter, enable_subtitle=enable_subtitle,
         )
         return docs
     
@@ -386,10 +480,11 @@ class OceanBase(VectorStore):
         embedding: List[float],
         k: int = 4,
         filter: Optional[dict] = None,
+        enable_subtitle: bool = False,
         **kwargs: Any,
     ) -> List[Document]:
         docs_and_scores = self.similarity_search_with_score_by_vector(
-            embedding=embedding, k=k, filter=filter
+            embedding=embedding, k=k, filter=filter, enable_subtitle=enable_subtitle,
         )
         return [doc for doc, _ in docs_and_scores]
 
@@ -398,6 +493,7 @@ class OceanBase(VectorStore):
         embedding: List[float],
         k: int = 4,
         filter: Optional[dict] = None,
+        enable_subtitle: bool = False,
     ) -> List[Tuple[Document, float]]:
         try:
             from sqlalchemy.engine import Row
@@ -410,20 +506,49 @@ class OceanBase(VectorStore):
         # filter is not support in OceanBase.
 
         embedding_str = to_db(embedding, self.embedding_dimension)
-        sql_query = f"""
-            SELECT document, metadata, embedding <-> '{embedding_str}' as distance
-            FROM {self.collection_name}
-            ORDER BY embedding <-> '{embedding_str}'
-            LIMIT :k
-        """
-        sql_query_str_for_log = f"""
-            SELECT document, metadata, embedding <-> '?' as distance
-            FROM {self.collection_name}
-            ORDER BY embedding <-> '?'
-            LIMIT {k}
-        """
+        
+        if not enable_subtitle:
+            sql_query = f"""
+                SELECT document, metadata, embedding <-> '{embedding_str}' as distance
+                FROM {self.collection_name}
+                ORDER BY embedding <-> '{embedding_str}'
+                LIMIT :k
+            """
+            sql_query_str_for_log = f"""
+                SELECT document, metadata, embedding <-> '?' as distance
+                FROM {self.collection_name}
+                ORDER BY embedding <-> '?'
+                LIMIT {k}
+            """
+        else:
+            sql_query = f"""
+                SELECT document, metadata, embedding <-> '{embedding_str}' as distance
+                FROM {self.collection_name}
+                where id in ((
+                    SELECT id FROM {self.subtitle_collection_name}
+                    ORDER BY embedding <-> '{embedding_str}'
+                    LIMIT :k2
+                ) union (
+                    SELECT id FROM {self.collection_name}
+                    ORDER BY embedding <-> '{embedding_str}'
+                    LIMIT :k
+                ))
+            """
+            sql_query_str_for_log = f"""
+                SELECT document, metadata, embedding <-> '?' as distance
+                FROM {self.collection_name}
+                where id in ((
+                    SELECT id FROM {self.subtitle_collection_name}
+                    ORDER BY embedding <-> '?'
+                    LIMIT :k2
+                ) union (
+                    SELECT id FROM {self.collection_name}
+                    ORDER BY embedding <-> '?'
+                    LIMIT :k
+                ))
+            """
 
-        params = {"k": k}
+        params = {"k2":k, "k": k}
         try:
             with ob_grwlock.reader_lock():
                 with self.engine.connect() as conn:
@@ -451,14 +576,15 @@ class OceanBase(VectorStore):
         query: str,
         k: int = 4,
         filter: Optional[dict] = None,
+        enable_subtitle: bool = False,
     ) -> List[Tuple[Document, float]]:
         embedding = self.embedding_function.embed_query(query)
         docs = self.similarity_search_with_score_by_vector(
-            embedding=embedding, k=k, filter=filter
+            embedding=embedding, k=k, filter=filter, enable_subtitle=enable_subtitle,
         )
         return docs
     
-    def delete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
+    def delete(self, ids: Optional[List[str]] = None, enable_subtitle: bool = False, **kwargs: Any) -> Optional[bool]:
         if ids is None:
             raise ValueError("No ids provided to delete.")
 
@@ -473,15 +599,31 @@ class OceanBase(VectorStore):
             keep_existing=True,
         )
 
+        subtitle_table = Table(
+            self.subtitle_collection_name,
+            Base.metadata,
+            Column("id", VARCHAR(40), primary_key=True),
+            Column("embedding", Vector(self.subtitle_embedding_dimension)),
+            Column("subtitles", LONGTEXT, nullable=True),
+            keep_existing=True,
+        )
+
         try:
             with self.engine.connect() as conn:
                 with conn.begin():
                     delete_condition = chunks_table.c.id.in_(ids)
                     delete_stmt = chunks_table.delete().where(delete_condition)
+                    delete_subtitle_condition = subtitle_table.c.id.in_(ids)
+                    delete_subtitle_stmt = subtitle_table.delete().where(delete_subtitle_condition)
                     with ob_grwlock.reader_lock():
                         if self.sql_logger is not None:
-                            self.sql_logger.debug(f"Trying to delete vectors: {str(delete_stmt)}")
+                            if not enable_subtitle:
+                                self.sql_logger.debug(f"Trying to delete vectors: {str(delete_stmt)}")
+                            else:
+                                self.sql_logger.debug(f"Trying to delete vectors: {str(delete_stmt)} & {str(delete_subtitle_stmt)}")
                         conn.execute(delete_stmt)
+                        if enable_subtitle:
+                            conn.execute(delete_subtitle_stmt)
                     return True
         except Exception as e:
             self.logger.error("Delete operation failed:", str(e))
